@@ -218,8 +218,9 @@ fn lolipop_crush(
     current_position: Vector2,
     current_geometry: Size,
 ) -> WinResult<()> {
-    if (current_position.X - state.previous_position.X).abs() < 0.001
-        && (current_position.Y - state.previous_position.Y).abs() < 0.001
+    // Match NSEqualPoints behavior - exact comparison
+    if current_position.X == state.previous_position.X
+        && current_position.Y == state.previous_position.Y
     {
         return Ok(());
     }
@@ -246,11 +247,18 @@ fn lolipop_crush(
     let dx = current_position.X - state.previous_position.X;
     let dy = current_position.Y - state.previous_position.Y;
 
-    let distance = (dx * dx + dy * dy).sqrt();
+    // Use hypot like ObjC version
+    let distance = dx.hypot(dy);
     let duration = 0.6 * (distance / 400.0).tanh();
 
+    // Query actual refresh rate if available, otherwise use 60fps
     let fps = get_monitor_refresh_rate();
-    let num_frames = ((duration * fps as f32).ceil() as usize).max(1);
+    let num_frames = (duration * fps as f32).ceil() as usize;
+
+    // Skip animation if duration is too short (matching ObjC behavior where frames=0 would cause issues)
+    if num_frames == 0 {
+        return Ok(());
+    }
 
     // Create a sprite shape for the animation
     let shape = compositor.CreateSpriteShape()?;
@@ -281,6 +289,12 @@ fn lolipop_crush(
     };
     offset_animation.SetDuration(duration_timespan)?;
     size_animation.SetDuration(duration_timespan)?;
+
+    // Set StopBehavior to SetToFinalValue to match CAKeyframeAnimation behavior
+    // where layer.path is set to paths.lastObject
+    use windows::UI::Composition::AnimationStopBehavior;
+    offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
+    size_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
 
     // Add keyframes for each animation frame
     for frame in 0..=num_frames {
