@@ -228,7 +228,7 @@ fn lolipop_crush(
 
     // Use hypot like ObjC version
     let distance = dx.hypot(dy);
-    let duration = 0.6 * (distance / 400.0).tanh();
+    let duration = 0.4 * (distance / 400.0).tanh(); // Faster animation
 
     // Skip animation if duration is too short
     if duration < 0.01 {
@@ -266,10 +266,10 @@ fn lolipop_crush(
 
     visual.Shapes()?.Append(&shape)?;
 
-    // Create CubicBezierEasingFunction for smooth ease-in-out animation
-    // Control points approximate ease-in-out cubic: (0.42, 0) and (0.58, 1)
+    // Create CubicBezierEasingFunction - ease-out for faster ending
+    // Control points: (0.0, 0.0) to (0.2, 1.0) for quick deceleration
     let easing = compositor
-        .CreateCubicBezierEasingFunction(Vector2::new(0.42, 0.0), Vector2::new(0.58, 1.0))?;
+        .CreateCubicBezierEasingFunction(Vector2::new(0.0, 0.0), Vector2::new(0.2, 1.0))?;
 
     // Create keyframe animations
     let size_animation = compositor.CreateVector2KeyFrameAnimation()?;
@@ -289,10 +289,12 @@ fn lolipop_crush(
     geo_offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
 
     // Animation: stretch from start to end, then shrink to end position
-    // Phase 1 (0.0 -> 0.5): Leading edge reaches target, rectangle stretches
-    // Phase 2 (0.5 -> 1.0): Trailing edge catches up, rectangle shrinks
+    // Phase 1 (0.0 -> 0.2): Leading edge moves ahead, rectangle stretches
+    // Phase 2 (0.2 -> 0.6): Trailing edge follows quickly toward target
 
-    let max_length = distance + previous_cursor.size.width;
+    let max_length = distance * 0.5 + previous_cursor.size.width;
+    let mid_cx = start_cx + (end_cx - start_cx) * 0.2;
+    let mid_cy = start_cy + (end_cy - start_cy) * 0.2;
 
     // Keyframe 0.0: Start position and size
     offset_animation.InsertKeyFrameWithEasingFunction(
@@ -311,36 +313,36 @@ fn lolipop_crush(
         &easing,
     )?;
 
-    // Keyframe 0.5: Maximum stretch (leading edge at target, trailing at start)
+    // Keyframe 0.2: Maximum stretch (trailing starts to leave, leading ahead)
     offset_animation.InsertKeyFrameWithEasingFunction(
-        0.5,
-        Vector2::new(start_cx, start_cy),
+        0.2,
+        Vector2::new(mid_cx, mid_cy),
         &easing,
     )?;
     size_animation.InsertKeyFrameWithEasingFunction(
-        0.5,
+        0.2,
         Vector2::new(max_length, thickness),
         &easing,
     )?;
     geo_offset_animation.InsertKeyFrameWithEasingFunction(
-        0.5,
+        0.2,
         Vector2::new(0.0, -thickness / 2.0),
         &easing,
     )?;
 
-    // Keyframe 1.0: End position (trailing edge catches up)
+    // Keyframe 0.6: End position (both edges at target, animation finishes early)
     offset_animation.InsertKeyFrameWithEasingFunction(
-        1.0,
+        0.6,
         Vector2::new(end_cx, end_cy),
         &easing,
     )?;
     size_animation.InsertKeyFrameWithEasingFunction(
-        1.0,
+        0.6,
         Vector2::new(current_cursor.size.width, thickness),
         &easing,
     )?;
     geo_offset_animation.InsertKeyFrameWithEasingFunction(
-        1.0,
+        0.6,
         Vector2::new(0.0, -thickness / 2.0),
         &easing,
     )?;
