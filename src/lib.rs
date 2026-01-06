@@ -2,6 +2,8 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
+mod common;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::raw;
@@ -16,7 +18,10 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::Win32::System::WinRT::RO_INIT_SINGLETHREADED;
+use windows::Win32::System::WinRT::RoInitialize;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::core::HRESULT;
 use windows::core::Interface;
 use windows::core::Result as WinResult;
 use windows_numerics::Vector2;
@@ -137,10 +142,42 @@ thread_local! {
 
 static INITIALIZED: OnceLock<bool> = OnceLock::new();
 
+#[repr(C)]
+struct DispatcherQueueOptions {
+    dw_size: u32,
+    thread_type: i32,
+    apartment_type: i32,
+}
+
+#[link(name = "coremessaging")]
+unsafe extern "system" {
+    fn CreateDispatcherQueueController(
+        options: DispatcherQueueOptions,
+        dispatcher_queue_controller: *mut *mut std::ffi::c_void,
+    ) -> HRESULT;
+}
+
+fn create_dispatcher_queue_controller() -> WinResult<*mut std::ffi::c_void> {
+    let options = DispatcherQueueOptions {
+        dw_size: std::mem::size_of::<DispatcherQueueOptions>() as u32,
+        thread_type: 2,    // DQTYPE_THREAD_CURRENT
+        apartment_type: 2, // DQTAT_COM_STA
+    };
+
+    let mut controller: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe {
+        CreateDispatcherQueueController(options, &mut controller).ok()?;
+        Ok(controller)
+    }
+}
+
 fn initialize_com() {
     INITIALIZED.get_or_init(|| {
         unsafe {
+            let _ = RoInitialize(RO_INIT_SINGLETHREADED);
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            // 创建 DispatcherQueue，Composition API 需要它来处理动画
+            let _ = create_dispatcher_queue_controller();
         }
         true
     });
@@ -410,6 +447,23 @@ unsafe extern "C" fn lolipop_lick(
     }
 }
 
+unsafe extern "C" fn lolipop_test_play(
+    env: *mut emacs_env,
+    _nargs: isize,
+    _args: *mut emacs_value,
+    _data: *mut raw::c_void,
+) -> emacs_value {
+    unsafe {
+        let intern = (*env).intern.unwrap_unchecked();
+        let hwnd = GetForegroundWindow();
+
+        match common::play_demo_animation(hwnd) {
+            Ok(_) => intern(env, c"t".as_ptr()),
+            Err(_) => intern(env, c"nil".as_ptr()),
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn emacs_module_init(runtime: *mut emacs_runtime) -> libc::c_int {
@@ -448,6 +502,31 @@ If RENDER is nil, only internal cursor state is updated.
         let defalias = intern(env, c"defalias".as_ptr());
 
         funcall(env, defalias, 2, [symbol, function].as_mut_ptr());
+
+        // 注册 test-play 函数
+        let test_play_doc = c"Play a test animation on the current Emacs frame.
+
+This function creates colorful bouncing, scaling and rotating squares
+on top of the current Emacs window for demonstration purposes.
+
+(fn)";
+
+        let test_play_function = make_function(
+            env,
+            0,
+            0,
+            Some(lolipop_test_play),
+            test_play_doc.as_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        let test_play_symbol = intern(env, c"lolipop-test-play".as_ptr());
+        funcall(
+            env,
+            defalias,
+            2,
+            [test_play_symbol, test_play_function].as_mut_ptr(),
+        );
 
         0
     }
