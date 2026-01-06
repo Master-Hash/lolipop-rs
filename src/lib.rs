@@ -42,6 +42,7 @@ fn bezier(t: f32) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
@@ -51,6 +52,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 // Helper function to calculate bounding rect from 4 corners
+#[allow(dead_code)]
 fn corners_to_rect(
     tl: (f32, f32),
     tr: (f32, f32),
@@ -76,6 +78,7 @@ struct Rect {
     size: Size,
 }
 
+#[allow(dead_code)]
 impl Rect {
     fn min_x(&self) -> f32 {
         self.origin.X
@@ -255,10 +258,22 @@ fn lolipop_crush(
     let fps = get_monitor_refresh_rate();
     let num_frames = (duration * fps as f32).ceil() as usize;
 
-    // Skip animation if duration is too short (matching ObjC behavior where frames=0 would cause issues)
+    // Skip animation if duration is too short
     if num_frames == 0 {
         return Ok(());
     }
+
+    // Calculate the center points of start and end cursors
+    let start_cx = previous_cursor.origin.X + previous_cursor.size.width / 2.0;
+    let start_cy = previous_cursor.origin.Y + previous_cursor.size.height / 2.0;
+    let end_cx = current_cursor.origin.X + current_cursor.size.width / 2.0;
+    let end_cy = current_cursor.origin.Y + current_cursor.size.height / 2.0;
+
+    // Calculate rotation angle for the connecting line
+    let angle = dy.atan2(dx);
+
+    // Use the cursor height as the line thickness
+    let thickness = current_cursor.size.height;
 
     // Create a sprite shape for the animation
     let shape = compositor.CreateSpriteShape()?;
@@ -266,98 +281,85 @@ fn lolipop_crush(
     brush.SetColor(state.color)?;
     shape.SetFillBrush(&brush)?;
 
-    // Create geometry with initial position
+    // Create rectangle geometry - we'll animate it as a line from start to end
+    // The rectangle is positioned at origin and we use shape transforms
     let geometry = compositor.CreateRectangleGeometry()?;
-    geometry.SetOffset(Vector2::new(
-        previous_cursor.min_x(),
-        previous_cursor.min_y(),
-    ))?;
-    geometry.SetSize(Vector2::new(
-        previous_cursor.size.width,
-        previous_cursor.size.height,
-    ))?;
+    // Start with the cursor size at the start position
+    geometry.SetOffset(Vector2::new(0.0, -thickness / 2.0))?;
+    geometry.SetSize(Vector2::new(previous_cursor.size.width, thickness))?;
     shape.SetGeometry(&geometry)?;
+
+    // Set rotation center at the left edge (where the line starts)
+    shape.SetRotationAngle(angle)?;
+    shape.SetOffset(Vector2::new(start_cx, start_cy))?;
 
     visual.Shapes()?.Append(&shape)?;
 
-    // Create keyframe animations for Offset and Size
-    let offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
+    // Create keyframe animations
     let size_animation = compositor.CreateVector2KeyFrameAnimation()?;
+    let offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
+    let rotation_animation = compositor.CreateScalarKeyFrameAnimation()?;
+    let geo_offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
 
     let duration_timespan = windows::Foundation::TimeSpan {
-        Duration: (duration * 10_000_000.0) as i64, // 100-nanosecond units
+        Duration: (duration * 10_000_000.0) as i64,
     };
-    offset_animation.SetDuration(duration_timespan)?;
     size_animation.SetDuration(duration_timespan)?;
+    offset_animation.SetDuration(duration_timespan)?;
+    rotation_animation.SetDuration(duration_timespan)?;
+    geo_offset_animation.SetDuration(duration_timespan)?;
 
-    // Set StopBehavior to SetToFinalValue to match CAKeyframeAnimation behavior
-    // where layer.path is set to paths.lastObject
     use windows::UI::Composition::AnimationStopBehavior;
-    offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
     size_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
+    offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
+    rotation_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
+    geo_offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
 
-    // Add keyframes for each animation frame
+    // Animation strategy:
+    // - The leading edge (front) moves fast toward the target
+    // - The trailing edge (back) follows slower
+    // - The rectangle rotates and stretches along the movement direction
+
     for frame in 0..=num_frames {
-        let alpha = frame as f32 / num_frames as f32;
-        let fast = bezier(clamp01(1.6 * alpha));
-        let norm = bezier(clamp01(1.6 * (alpha - 0.2)));
-        let slow = bezier(clamp01(1.6 * (alpha - 0.4)));
+        let t = frame as f32 / num_frames as f32;
 
-        let (tl_ease, tr_ease, br_ease, bl_ease) = if dx.abs() < current_geometry.width {
-            if dy > 0.0 {
-                (slow, slow, fast, fast)
-            } else {
-                (fast, fast, slow, slow)
-            }
-        } else if dy.abs() < current_geometry.height {
-            if dx > 0.0 {
-                (slow, fast, fast, slow)
-            } else {
-                (fast, slow, slow, fast)
-            }
-        } else if dx > 0.0 {
-            if dy > 0.0 {
-                (slow, norm, fast, norm)
-            } else {
-                (norm, fast, norm, slow)
-            }
-        } else if dy > 0.0 {
-            (norm, slow, norm, fast)
-        } else {
-            (fast, norm, slow, norm)
-        };
+        // Leading edge moves faster
+        let lead_t = bezier(clamp01(t * 1.5));
+        // Trailing edge follows slower
+        let trail_t = bezier(clamp01((t - 0.3) * 1.5));
 
-        let tl = (
-            lerp(previous_cursor.min_x(), current_cursor.min_x(), tl_ease),
-            lerp(previous_cursor.min_y(), current_cursor.min_y(), tl_ease),
-        );
-        let tr = (
-            lerp(previous_cursor.max_x(), current_cursor.max_x(), tr_ease),
-            lerp(previous_cursor.min_y(), current_cursor.min_y(), tr_ease),
-        );
-        let br = (
-            lerp(previous_cursor.max_x(), current_cursor.max_x(), br_ease),
-            lerp(previous_cursor.max_y(), current_cursor.max_y(), br_ease),
-        );
-        let bl = (
-            lerp(previous_cursor.min_x(), current_cursor.min_x(), bl_ease),
-            lerp(previous_cursor.max_y(), current_cursor.max_y(), bl_ease),
-        );
+        // Calculate positions of leading and trailing edges along the line
+        let lead_cx = lerp(start_cx, end_cx, lead_t);
+        let lead_cy = lerp(start_cy, end_cy, lead_t);
+        let trail_cx = lerp(start_cx, end_cx, trail_t);
+        let trail_cy = lerp(start_cy, end_cy, trail_t);
 
-        let (x, y, w, h) = corners_to_rect(tl, tr, br, bl);
+        // The line goes from trail position to lead position
+        let line_dx = lead_cx - trail_cx;
+        let line_dy = lead_cy - trail_cy;
+        let line_length = line_dx.hypot(line_dy).max(1.0);
+        let line_angle = line_dy.atan2(line_dx);
 
-        // Linear progress for keyframe position
-        let progress = alpha;
-        offset_animation.InsertKeyFrame(progress, Vector2::new(x, y))?;
-        size_animation.InsertKeyFrame(progress, Vector2::new(w, h))?;
+        // Interpolate thickness
+        let current_thickness = lerp(previous_cursor.size.height, thickness, lead_t);
+
+        // Shape offset is at the trailing edge (start of the line)
+        offset_animation.InsertKeyFrame(t, Vector2::new(trail_cx, trail_cy))?;
+        rotation_animation.InsertKeyFrame(t, line_angle)?;
+
+        // Geometry size: length x thickness
+        size_animation.InsertKeyFrame(t, Vector2::new(line_length, current_thickness))?;
+        geo_offset_animation.InsertKeyFrame(t, Vector2::new(0.0, -current_thickness / 2.0))?;
     }
 
     // Create a scoped batch to track animation completion
     let batch = compositor.CreateScopedBatch(CompositionBatchTypes::Animation)?;
 
-    // Start the animations on the geometry
-    geometry.StartAnimation(windows::core::h!("Offset"), &offset_animation)?;
+    // Start the animations
+    shape.StartAnimation(windows::core::h!("Offset"), &offset_animation)?;
+    shape.StartAnimation(windows::core::h!("RotationAngle"), &rotation_animation)?;
     geometry.StartAnimation(windows::core::h!("Size"), &size_animation)?;
+    geometry.StartAnimation(windows::core::h!("Offset"), &geo_offset_animation)?;
 
     batch.End()?;
 
@@ -365,11 +367,9 @@ fn lolipop_crush(
     let shapes = visual.Shapes()?;
     let shape_clone = shape.clone();
     batch.Completed(&TypedEventHandler::new(move |_batch, _args| {
-        // Find and remove the shape by iterating through the collection
         if let Ok(count) = shapes.Size() {
             for i in 0..count {
                 if let Ok(s) = shapes.GetAt(i) {
-                    // Use IUnknown comparison for COM object identity
                     use windows::core::Interface;
                     if let (Ok(unk1), Ok(unk2)) = (
                         s.cast::<windows::core::IUnknown>(),
@@ -385,10 +385,9 @@ fn lolipop_crush(
         Ok(())
     }))?;
 
-    // Store animation entry (for tracking, though cleanup is handled by the completion handler)
+    // Store animation entry
     state.animations.push_back(AnimationEntry { shape, batch });
 
-    // Clean up old entries from the deque (they should already be removed by completion handlers)
     cleanup_finished_animations(state);
 
     Ok(())
