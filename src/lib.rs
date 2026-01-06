@@ -7,7 +7,6 @@ use std::collections::VecDeque;
 use std::os::raw;
 use std::sync::OnceLock;
 use std::time::Instant;
-
 use windows::UI::Color;
 use windows::UI::Composition::CompositionRectangleGeometry;
 use windows::UI::Composition::Compositor;
@@ -61,12 +60,6 @@ fn corners_to_rect(
 }
 
 #[derive(Clone, Copy)]
-struct Point {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Clone, Copy)]
 struct Size {
     width: f32,
     height: f32,
@@ -74,22 +67,22 @@ struct Size {
 
 #[derive(Clone, Copy)]
 struct Rect {
-    origin: Point,
+    origin: Vector2,
     size: Size,
 }
 
 impl Rect {
     fn min_x(&self) -> f32 {
-        self.origin.x
+        self.origin.X
     }
     fn max_x(&self) -> f32 {
-        self.origin.x + self.size.width
+        self.origin.X + self.size.width
     }
     fn min_y(&self) -> f32 {
-        self.origin.y
+        self.origin.Y
     }
     fn max_y(&self) -> f32 {
-        self.origin.y + self.size.height
+        self.origin.Y + self.size.height
     }
 }
 
@@ -109,7 +102,7 @@ struct LolipopState {
     visual: Option<ShapeVisual>,
     color: Color,
     state: bool,
-    previous_position: Point,
+    previous_position: Vector2,
     previous_geometry: Size,
     animations: VecDeque<AnimationFrame>,
 }
@@ -128,7 +121,7 @@ impl Default for LolipopState {
                 B: 255,
             },
             state: false,
-            previous_position: Point { x: 0.0, y: 0.0 },
+            previous_position: Vector2::new(0.0, 0.0),
             previous_geometry: Size {
                 width: 0.0,
                 height: 0.0,
@@ -188,11 +181,11 @@ fn ensure_compositor(state: &mut LolipopState, hwnd: HWND) -> WinResult<()> {
 
 fn lolipop_crush(
     state: &mut LolipopState,
-    current_position: Point,
+    current_position: Vector2,
     current_geometry: Size,
 ) -> WinResult<()> {
-    if (current_position.x - state.previous_position.x).abs() < 0.001
-        && (current_position.y - state.previous_position.y).abs() < 0.001
+    if (current_position.X - state.previous_position.X).abs() < 0.001
+        && (current_position.Y - state.previous_position.Y).abs() < 0.001
     {
         return Ok(());
     }
@@ -216,8 +209,8 @@ fn lolipop_crush(
         size: current_geometry,
     };
 
-    let dx = current_position.x - state.previous_position.x;
-    let dy = current_position.y - state.previous_position.y;
+    let dx = current_position.X - state.previous_position.X;
+    let dy = current_position.Y - state.previous_position.Y;
 
     let distance = (dx * dx + dy * dy).sqrt();
     let duration = 0.6 * (distance / 400.0).tanh();
@@ -361,7 +354,7 @@ fn lolipop_chew(x: f32, y: f32, width: f32, height: f32, render: bool) -> WinRes
 
         ensure_compositor(&mut state, hwnd)?;
 
-        let position = Point { x, y };
+        let position = Vector2::new(x, y);
         let geometry = Size { width, height };
 
         // Update any ongoing animations
