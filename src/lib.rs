@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::raw;
 use std::sync::OnceLock;
-use std::time::Instant;
+use windows::Foundation::TypedEventHandler;
 use windows::UI::Color;
-use windows::UI::Composition::CompositionRectangleGeometry;
+use windows::UI::Composition::CompositionBatchTypes;
 use windows::UI::Composition::Compositor;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::ShapeVisual;
@@ -92,12 +92,9 @@ impl Rect {
 }
 
 #[allow(dead_code)]
-struct AnimationFrame {
+struct AnimationEntry {
     shape: windows::UI::Composition::CompositionSpriteShape,
-    geometry: CompositionRectangleGeometry,
-    start_time: Instant,
-    duration: f32,
-    paths: Vec<(f32, f32, f32, f32)>, // (x, y, width, height) for each frame
+    batch: windows::UI::Composition::CompositionScopedBatch,
 }
 
 struct LolipopState {
@@ -109,7 +106,7 @@ struct LolipopState {
     state: bool,
     previous_position: Vector2,
     previous_geometry: Size,
-    animations: VecDeque<AnimationFrame>,
+    animations: VecDeque<AnimationEntry>,
 }
 
 impl Default for LolipopState {
@@ -255,9 +252,37 @@ fn lolipop_crush(
     let fps = get_monitor_refresh_rate();
     let num_frames = ((duration * fps as f32).ceil() as usize).max(1);
 
-    // Pre-calculate all frame positions as bounding rectangles
-    let mut paths: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(num_frames + 1);
+    // Create a sprite shape for the animation
+    let shape = compositor.CreateSpriteShape()?;
+    let brush = compositor.CreateColorBrush()?;
+    brush.SetColor(state.color)?;
+    shape.SetFillBrush(&brush)?;
 
+    // Create geometry with initial position
+    let geometry = compositor.CreateRectangleGeometry()?;
+    geometry.SetOffset(Vector2::new(
+        previous_cursor.min_x(),
+        previous_cursor.min_y(),
+    ))?;
+    geometry.SetSize(Vector2::new(
+        previous_cursor.size.width,
+        previous_cursor.size.height,
+    ))?;
+    shape.SetGeometry(&geometry)?;
+
+    visual.Shapes()?.Append(&shape)?;
+
+    // Create keyframe animations for Offset and Size
+    let offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
+    let size_animation = compositor.CreateVector2KeyFrameAnimation()?;
+
+    let duration_timespan = windows::Foundation::TimeSpan {
+        Duration: (duration * 10_000_000.0) as i64, // 100-nanosecond units
+    };
+    offset_animation.SetDuration(duration_timespan)?;
+    size_animation.SetDuration(duration_timespan)?;
+
+    // Add keyframes for each animation frame
     for frame in 0..=num_frames {
         let alpha = frame as f32 / num_frames as f32;
         let fast = bezier(clamp01(1.6 * alpha));
@@ -305,82 +330,57 @@ fn lolipop_crush(
             lerp(previous_cursor.max_y(), current_cursor.max_y(), bl_ease),
         );
 
-        paths.push(corners_to_rect(tl, tr, br, bl));
+        let (x, y, w, h) = corners_to_rect(tl, tr, br, bl);
+
+        // Linear progress for keyframe position
+        let progress = alpha;
+        offset_animation.InsertKeyFrame(progress, Vector2::new(x, y))?;
+        size_animation.InsertKeyFrame(progress, Vector2::new(w, h))?;
     }
 
-    // Create a sprite shape for the animation
-    let shape = compositor.CreateSpriteShape()?;
-    let brush = compositor.CreateColorBrush()?;
-    brush.SetColor(state.color)?;
-    shape.SetFillBrush(&brush)?;
+    // Create a scoped batch to track animation completion
+    let batch = compositor.CreateScopedBatch(CompositionBatchTypes::Animation)?;
 
-    // Create geometry and set initial state from first frame
-    let geometry = compositor.CreateRectangleGeometry()?;
-    if let Some(&(x, y, w, h)) = paths.first() {
-        geometry.SetOffset(Vector2::new(x, y))?;
-        geometry.SetSize(Vector2::new(w, h))?;
-    }
-    shape.SetGeometry(&geometry)?;
+    // Start the animations on the geometry
+    geometry.StartAnimation(windows::core::h!("Offset"), &offset_animation)?;
+    geometry.StartAnimation(windows::core::h!("Size"), &size_animation)?;
 
-    visual.Shapes()?.Append(&shape)?;
+    batch.End()?;
 
-    // Store animation state for manual updates
-    state.animations.push_back(AnimationFrame {
-        shape,
-        geometry,
-        start_time: Instant::now(),
-        duration,
-        paths,
-    });
+    // Set up completion handler to remove the shape when animation ends
+    let shapes = visual.Shapes()?;
+    let shape_clone = shape.clone();
+    batch.Completed(&TypedEventHandler::new(move |_batch, _args| {
+        // Find and remove the shape by iterating through the collection
+        if let Ok(count) = shapes.Size() {
+            for i in 0..count {
+                if let Ok(s) = shapes.GetAt(i) {
+                    // Compare by checking if it's the same shape
+                    if std::ptr::eq(s.as_raw() as *const _, shape_clone.as_raw() as *const _) {
+                        let _ = shapes.RemoveAt(i);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }))?;
 
-    // Clean up old completed animations
-    update_animations(state)?;
+    // Store animation entry (for tracking, though cleanup is handled by the completion handler)
+    state.animations.push_back(AnimationEntry { shape, batch });
+
+    // Clean up old entries from the deque (they should already be removed by completion handlers)
+    cleanup_finished_animations(state);
 
     Ok(())
 }
 
-fn update_animations(state: &mut LolipopState) -> WinResult<()> {
-    let visual = match &state.visual {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-
-    let shapes = visual.Shapes()?;
-    let now = Instant::now();
-
-    // Track indices to remove
-    let mut to_remove = Vec::new();
-
-    for (idx, anim) in state.animations.iter_mut().enumerate() {
-        let elapsed = now.duration_since(anim.start_time).as_secs_f32();
-
-        if elapsed >= anim.duration {
-            to_remove.push(idx);
-            continue;
-        }
-
-        // Calculate current frame
-        let progress = elapsed / anim.duration;
-        let frame_idx =
-            ((progress * (anim.paths.len() - 1) as f32) as usize).min(anim.paths.len() - 1);
-
-        if let Some(&(x, y, w, h)) = anim.paths.get(frame_idx) {
-            let _ = anim.geometry.SetOffset(Vector2::new(x, y));
-            let _ = anim.geometry.SetSize(Vector2::new(w, h));
-        }
+fn cleanup_finished_animations(state: &mut LolipopState) {
+    // Remove entries where the batch has already completed
+    // Since we use completion handlers, we just limit the queue size
+    while state.animations.len() > 100 {
+        state.animations.pop_front();
     }
-
-    // Remove completed animations from back to front
-    for idx in to_remove.into_iter().rev() {
-        // Remove the shape from the visual's shapes collection
-        if shapes.Size().is_ok_and(|size| size > 0) {
-            // Remove the oldest shape (at index 0) since animations complete in order
-            let _ = shapes.RemoveAt(0);
-        }
-        state.animations.remove(idx);
-    }
-
-    Ok(())
 }
 
 fn lolipop_chew(x: f32, y: f32, width: f32, height: f32, render: bool) -> WinResult<()> {
@@ -393,9 +393,6 @@ fn lolipop_chew(x: f32, y: f32, width: f32, height: f32, render: bool) -> WinRes
 
         let position = Vector2::new(x, y);
         let geometry = Size { width, height };
-
-        // Update any ongoing animations
-        let _ = update_animations(&mut state);
 
         if state.state && render {
             lolipop_crush(&mut state, position, geometry)?;
