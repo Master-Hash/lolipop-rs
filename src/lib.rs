@@ -355,8 +355,13 @@ fn lolipop_crush(
         if let Ok(count) = shapes.Size() {
             for i in 0..count {
                 if let Ok(s) = shapes.GetAt(i) {
-                    // Compare by checking if it's the same shape
-                    if std::ptr::eq(s.as_raw() as *const _, shape_clone.as_raw() as *const _) {
+                    // Use IUnknown comparison for COM object identity
+                    use windows::core::Interface;
+                    if let (Ok(unk1), Ok(unk2)) = (
+                        s.cast::<windows::core::IUnknown>(),
+                        shape_clone.cast::<windows::core::IUnknown>(),
+                    ) && unk1 == unk2
+                    {
                         let _ = shapes.RemoveAt(i);
                         break;
                     }
