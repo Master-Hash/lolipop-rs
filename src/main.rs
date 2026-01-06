@@ -1,9 +1,13 @@
-use windows::{
-    Foundation::TimeSpan, UI::Color, UI::Composition::*, Win32::Foundation::*,
-    Win32::Graphics::Gdi::*, Win32::System::Com::*, Win32::System::LibraryLoader::GetModuleHandleW,
-    Win32::System::WinRT::Composition::ICompositorDesktopInterop, Win32::System::WinRT::*,
-    Win32::UI::WindowsAndMessaging::*, core::*,
-};
+use windows::Foundation::TimeSpan;
+use windows::UI::Color;
+use windows::UI::Composition::*;
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::Win32::System::WinRT::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::*;
 use windows_numerics::{Vector2, Vector3};
 
 #[repr(C)]
@@ -46,9 +50,6 @@ fn duration_ms(ms: i64) -> TimeSpan {
 
 fn main() -> Result<()> {
     unsafe {
-        // 初始化 COM
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-
         // 初始化 WinRT
         RoInitialize(RO_INIT_SINGLETHREADED)?;
 
