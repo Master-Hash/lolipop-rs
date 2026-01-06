@@ -9,12 +9,23 @@ use std::collections::VecDeque;
 use std::os::raw;
 use std::sync::OnceLock;
 use windows::Foundation::TypedEventHandler;
+use windows::Graphics::IGeometrySource2D;
 use windows::UI::Color;
 use windows::UI::Composition::CompositionBatchTypes;
+use windows::UI::Composition::CompositionPath;
 use windows::UI::Composition::Compositor;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::ShapeVisual;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_BEZIER_SEGMENT;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_FILLED;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_CLOSED;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_FILL_MODE_WINDING;
+use windows::Win32::Graphics::Direct2D::D2D1_FACTORY_OPTIONS;
+use windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_SINGLE_THREADED;
+use windows::Win32::Graphics::Direct2D::D2D1CreateFactory;
+use windows::Win32::Graphics::Direct2D::ID2D1Factory1;
+use windows::Win32::Graphics::Direct2D::ID2D1PathGeometry1;
 use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
@@ -105,6 +116,7 @@ struct LolipopState {
     compositor: Option<Compositor>,
     target: Option<DesktopWindowTarget>,
     visual: Option<ShapeVisual>,
+    d2d_factory: Option<ID2D1Factory1>,
     color: Color,
     state: bool,
     previous_position: Vector2,
@@ -119,6 +131,7 @@ impl Default for LolipopState {
             compositor: None,
             target: None,
             visual: None,
+            d2d_factory: None,
             color: Color {
                 A: 255,
                 R: 255,
@@ -208,12 +221,106 @@ fn ensure_compositor(state: &mut LolipopState, hwnd: HWND) -> WinResult<()> {
 
         target.SetRoot(&root)?;
 
+        // Create Direct2D Factory for path geometry
+        let d2d_factory: ID2D1Factory1 = unsafe {
+            D2D1CreateFactory(
+                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                Some(&D2D1_FACTORY_OPTIONS::default()),
+            )?
+        };
+
         state.compositor = Some(compositor);
         state.target = Some(target);
         state.visual = Some(visual);
+        state.d2d_factory = Some(d2d_factory);
         state.state = false;
     }
     Ok(())
+}
+
+/// Create a ribbon-shaped path geometry using Direct2D
+/// The ribbon connects two cursor positions with smooth bezier curves
+#[allow(clippy::too_many_arguments)]
+fn create_ribbon_path(
+    factory: &ID2D1Factory1,
+    // Trailing edge (start) position and dimensions
+    trail_x: f32,
+    trail_y: f32,
+    trail_width: f32,
+    trail_height: f32,
+    // Leading edge (end) position and dimensions
+    lead_x: f32,
+    lead_y: f32,
+    lead_width: f32,
+    lead_height: f32,
+) -> WinResult<ID2D1PathGeometry1> {
+    let path_geometry = unsafe { factory.CreatePathGeometry()? };
+    let sink = unsafe { path_geometry.Open()? };
+
+    unsafe {
+        sink.SetFillMode(D2D1_FILL_MODE_WINDING);
+
+        // Calculate corner points for the ribbon
+        // Trail (start) rectangle corners - right edge
+        let trail_tr = Vector2::new(trail_x + trail_width, trail_y);
+        let trail_br = Vector2::new(trail_x + trail_width, trail_y + trail_height);
+
+        // Lead (end) rectangle corners - left edge
+        let lead_tl = Vector2::new(lead_x, lead_y);
+        let lead_bl = Vector2::new(lead_x, lead_y + lead_height);
+
+        // Calculate direction vector from trail to lead
+        let dx = (lead_x + lead_width / 2.0) - (trail_x + trail_width / 2.0);
+        let dy = (lead_y + lead_height / 2.0) - (trail_y + trail_height / 2.0);
+        let dist = dx.hypot(dy).max(1.0);
+
+        // Control point offset for bezier curves (proportional to distance)
+        let ctrl_offset = dist * 0.4;
+        let dir_x = dx / dist;
+        let dir_y = dy / dist;
+
+        // Start the figure from trail top-right corner
+        sink.BeginFigure(trail_tr, D2D1_FIGURE_BEGIN_FILLED);
+
+        // Top edge: bezier from trail_tr to lead_tl
+        let top_ctrl1 = Vector2::new(
+            trail_tr.X + ctrl_offset * dir_x,
+            trail_tr.Y + ctrl_offset * dir_y,
+        );
+        let top_ctrl2 = Vector2::new(
+            lead_tl.X - ctrl_offset * dir_x,
+            lead_tl.Y - ctrl_offset * dir_y,
+        );
+        sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+            point1: top_ctrl1,
+            point2: top_ctrl2,
+            point3: lead_tl,
+        });
+
+        // Lead left edge: line from lead_tl to lead_bl
+        sink.AddLines(&[lead_bl]);
+
+        // Bottom edge: bezier from lead_bl to trail_br
+        let bottom_ctrl1 = Vector2::new(
+            lead_bl.X - ctrl_offset * dir_x,
+            lead_bl.Y - ctrl_offset * dir_y,
+        );
+        let bottom_ctrl2 = Vector2::new(
+            trail_br.X + ctrl_offset * dir_x,
+            trail_br.Y + ctrl_offset * dir_y,
+        );
+        sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+            point1: bottom_ctrl1,
+            point2: bottom_ctrl2,
+            point3: trail_br,
+        });
+
+        // Trail right edge closes back to start
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+    }
+
+    Ok(path_geometry)
 }
 
 fn lolipop_crush(
@@ -235,6 +342,11 @@ fn lolipop_crush(
 
     let visual = match &state.visual {
         Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let d2d_factory = match &state.d2d_factory {
+        Some(f) => f,
         None => return Ok(()),
     };
 
@@ -264,61 +376,58 @@ fn lolipop_crush(
     }
 
     // Calculate the center points of start and end cursors
-    let start_cx = previous_cursor.origin.X + previous_cursor.size.width / 2.0;
-    let start_cy = previous_cursor.origin.Y + previous_cursor.size.height / 2.0;
-    let end_cx = current_cursor.origin.X + current_cursor.size.width / 2.0;
-    let end_cy = current_cursor.origin.Y + current_cursor.size.height / 2.0;
+    let start_x = previous_cursor.origin.X;
+    let start_y = previous_cursor.origin.Y;
+    let start_width = previous_cursor.size.width;
+    let start_height = previous_cursor.size.height;
 
-    // Calculate rotation angle for the connecting line
-    let angle = dy.atan2(dx);
+    let end_x = current_cursor.origin.X;
+    let end_y = current_cursor.origin.Y;
+    let end_width = current_cursor.size.width;
+    let end_height = current_cursor.size.height;
 
-    // Use the cursor height as the line thickness
-    let thickness = current_cursor.size.height;
+    // Create initial ribbon path geometry using D2D
+    let initial_path = create_ribbon_path(
+        d2d_factory,
+        start_x,
+        start_y,
+        start_width,
+        start_height,
+        start_x,
+        start_y,
+        start_width,
+        start_height,
+    )?;
+
+    // Convert D2D geometry to CompositionPath via IGeometrySource2D
+    let geometry_source: IGeometrySource2D = initial_path.cast()?;
+    let composition_path = CompositionPath::Create(&geometry_source)?;
+    let path_geometry = compositor.CreatePathGeometry()?;
+    path_geometry.SetPath(&composition_path)?;
 
     // Create a sprite shape for the animation
     let shape = compositor.CreateSpriteShape()?;
     let brush = compositor.CreateColorBrush()?;
     brush.SetColor(state.color)?;
     shape.SetFillBrush(&brush)?;
-
-    // Create rectangle geometry - we'll animate it as a line from start to end
-    // The rectangle is positioned at origin and we use shape transforms
-    let geometry = compositor.CreateRectangleGeometry()?;
-    // Start with the cursor size at the start position
-    geometry.SetOffset(Vector2::new(0.0, -thickness / 2.0))?;
-    geometry.SetSize(Vector2::new(previous_cursor.size.width, thickness))?;
-    shape.SetGeometry(&geometry)?;
-
-    // Set rotation center at the left edge (where the line starts)
-    shape.SetRotationAngle(angle)?;
-    shape.SetOffset(Vector2::new(start_cx, start_cy))?;
+    shape.SetGeometry(&path_geometry)?;
 
     visual.Shapes()?.Append(&shape)?;
 
-    // Create keyframe animations
-    let size_animation = compositor.CreateVector2KeyFrameAnimation()?;
-    let offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
-    let rotation_animation = compositor.CreateScalarKeyFrameAnimation()?;
-    let geo_offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
-
+    // Create path keyframe animation
+    let path_animation = compositor.CreatePathKeyFrameAnimation()?;
     let duration_timespan = windows::Foundation::TimeSpan {
         Duration: (duration * 10_000_000.0) as i64,
     };
-    size_animation.SetDuration(duration_timespan)?;
-    offset_animation.SetDuration(duration_timespan)?;
-    rotation_animation.SetDuration(duration_timespan)?;
-    geo_offset_animation.SetDuration(duration_timespan)?;
+    path_animation.SetDuration(duration_timespan)?;
 
     use windows::UI::Composition::AnimationStopBehavior;
-    size_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
-    offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
-    rotation_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
-    geo_offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
+    path_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
 
     // Animation strategy:
     // - The leading edge (front) moves fast toward the target
     // - The trailing edge (back) follows slower
-    // - The rectangle rotates and stretches along the movement direction
+    // - Creates a ribbon/trail effect
 
     for frame in 0..=num_frames {
         let t = frame as f32 / num_frames as f32;
@@ -328,38 +437,41 @@ fn lolipop_crush(
         // Trailing edge follows slower
         let trail_t = bezier(clamp01((t - 0.3) * 1.5));
 
-        // Calculate positions of leading and trailing edges along the line
-        let lead_cx = lerp(start_cx, end_cx, lead_t);
-        let lead_cy = lerp(start_cy, end_cy, lead_t);
-        let trail_cx = lerp(start_cx, end_cx, trail_t);
-        let trail_cy = lerp(start_cy, end_cy, trail_t);
+        // Calculate positions of leading and trailing edges
+        let trail_x = lerp(start_x, end_x, trail_t);
+        let trail_y = lerp(start_y, end_y, trail_t);
+        let trail_width = lerp(start_width, end_width, trail_t);
+        let trail_height = lerp(start_height, end_height, trail_t);
 
-        // The line goes from trail position to lead position
-        let line_dx = lead_cx - trail_cx;
-        let line_dy = lead_cy - trail_cy;
-        let line_length = line_dx.hypot(line_dy).max(1.0);
-        let line_angle = line_dy.atan2(line_dx);
+        let lead_x = lerp(start_x, end_x, lead_t);
+        let lead_y = lerp(start_y, end_y, lead_t);
+        let lead_width = lerp(start_width, end_width, lead_t);
+        let lead_height = lerp(start_height, end_height, lead_t);
 
-        // Interpolate thickness
-        let current_thickness = lerp(previous_cursor.size.height, thickness, lead_t);
+        // Create path for this keyframe
+        let frame_path = create_ribbon_path(
+            d2d_factory,
+            trail_x,
+            trail_y,
+            trail_width,
+            trail_height,
+            lead_x,
+            lead_y,
+            lead_width,
+            lead_height,
+        )?;
 
-        // Shape offset is at the trailing edge (start of the line)
-        offset_animation.InsertKeyFrame(t, Vector2::new(trail_cx, trail_cy))?;
-        rotation_animation.InsertKeyFrame(t, line_angle)?;
+        let frame_geometry_source: IGeometrySource2D = frame_path.cast()?;
+        let frame_composition_path = CompositionPath::Create(&frame_geometry_source)?;
 
-        // Geometry size: length x thickness
-        size_animation.InsertKeyFrame(t, Vector2::new(line_length, current_thickness))?;
-        geo_offset_animation.InsertKeyFrame(t, Vector2::new(0.0, -current_thickness / 2.0))?;
+        path_animation.InsertKeyFrame(t, &frame_composition_path)?;
     }
 
     // Create a scoped batch to track animation completion
     let batch = compositor.CreateScopedBatch(CompositionBatchTypes::Animation)?;
 
-    // Start the animations
-    shape.StartAnimation(windows::core::h!("Offset"), &offset_animation)?;
-    shape.StartAnimation(windows::core::h!("RotationAngle"), &rotation_animation)?;
-    geometry.StartAnimation(windows::core::h!("Size"), &size_animation)?;
-    geometry.StartAnimation(windows::core::h!("Offset"), &geo_offset_animation)?;
+    // Start the path animation
+    path_geometry.StartAnimation(windows::core::h!("Path"), &path_animation)?;
 
     batch.End()?;
 
