@@ -32,25 +32,6 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 #[allow(non_upper_case_globals)]
 pub static plugin_is_GPL_compatible: libc::c_int = 1;
 
-// Bezier easing function (ease-in-out cubic)
-fn bezier(t: f32) -> f32 {
-    if t < 0.5 {
-        4.0 * t * t * t
-    } else {
-        let u = 2.0 * t - 2.0;
-        0.5 * u * u * u + 1.0
-    }
-}
-
-#[allow(dead_code)]
-fn clamp01(x: f32) -> f32 {
-    x.clamp(0.0, 1.0)
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
 // Helper function to calculate bounding rect from 4 corners
 #[allow(dead_code)]
 fn corners_to_rect(
@@ -183,11 +164,6 @@ fn initialize_com() {
     });
 }
 
-fn get_monitor_refresh_rate() -> u32 {
-    // Default to 60 FPS, could query actual refresh rate if needed
-    60
-}
-
 fn ensure_compositor(state: &mut LolipopState, hwnd: HWND) -> WinResult<()> {
     if state.hwnd != hwnd || state.compositor.is_none() {
         state.hwnd = hwnd;
@@ -254,12 +230,8 @@ fn lolipop_crush(
     let distance = dx.hypot(dy);
     let duration = 0.6 * (distance / 400.0).tanh();
 
-    // Query actual refresh rate if available, otherwise use 60fps
-    let fps = get_monitor_refresh_rate();
-    let num_frames = (duration * fps as f32).ceil() as usize;
-
     // Skip animation if duration is too short
-    if num_frames == 0 {
+    if duration < 0.01 {
         return Ok(());
     }
 
@@ -274,6 +246,7 @@ fn lolipop_crush(
 
     // Use the cursor height as the line thickness
     let thickness = current_cursor.size.height;
+    let start_thickness = previous_cursor.size.height;
 
     // Create a sprite shape for the animation
     let shape = compositor.CreateSpriteShape()?;
@@ -281,24 +254,26 @@ fn lolipop_crush(
     brush.SetColor(state.color)?;
     shape.SetFillBrush(&brush)?;
 
-    // Create rectangle geometry - we'll animate it as a line from start to end
-    // The rectangle is positioned at origin and we use shape transforms
+    // Create rectangle geometry
     let geometry = compositor.CreateRectangleGeometry()?;
-    // Start with the cursor size at the start position
-    geometry.SetOffset(Vector2::new(0.0, -thickness / 2.0))?;
-    geometry.SetSize(Vector2::new(previous_cursor.size.width, thickness))?;
+    geometry.SetOffset(Vector2::new(0.0, -start_thickness / 2.0))?;
+    geometry.SetSize(Vector2::new(previous_cursor.size.width, start_thickness))?;
     shape.SetGeometry(&geometry)?;
 
-    // Set rotation center at the left edge (where the line starts)
+    // Set rotation angle for the movement direction
     shape.SetRotationAngle(angle)?;
     shape.SetOffset(Vector2::new(start_cx, start_cy))?;
 
     visual.Shapes()?.Append(&shape)?;
 
+    // Create CubicBezierEasingFunction for smooth ease-in-out animation
+    // Control points approximate ease-in-out cubic: (0.42, 0) and (0.58, 1)
+    let easing = compositor
+        .CreateCubicBezierEasingFunction(Vector2::new(0.42, 0.0), Vector2::new(0.58, 1.0))?;
+
     // Create keyframe animations
     let size_animation = compositor.CreateVector2KeyFrameAnimation()?;
     let offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
-    let rotation_animation = compositor.CreateScalarKeyFrameAnimation()?;
     let geo_offset_animation = compositor.CreateVector2KeyFrameAnimation()?;
 
     let duration_timespan = windows::Foundation::TimeSpan {
@@ -306,58 +281,75 @@ fn lolipop_crush(
     };
     size_animation.SetDuration(duration_timespan)?;
     offset_animation.SetDuration(duration_timespan)?;
-    rotation_animation.SetDuration(duration_timespan)?;
     geo_offset_animation.SetDuration(duration_timespan)?;
 
     use windows::UI::Composition::AnimationStopBehavior;
     size_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
     offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
-    rotation_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
     geo_offset_animation.SetStopBehavior(AnimationStopBehavior::SetToFinalValue)?;
 
-    // Animation strategy:
-    // - The leading edge (front) moves fast toward the target
-    // - The trailing edge (back) follows slower
-    // - The rectangle rotates and stretches along the movement direction
+    // Animation: stretch from start to end, then shrink to end position
+    // Phase 1 (0.0 -> 0.5): Leading edge reaches target, rectangle stretches
+    // Phase 2 (0.5 -> 1.0): Trailing edge catches up, rectangle shrinks
 
-    for frame in 0..=num_frames {
-        let t = frame as f32 / num_frames as f32;
+    let max_length = distance + previous_cursor.size.width;
 
-        // Leading edge moves faster
-        let lead_t = bezier(clamp01(t * 1.5));
-        // Trailing edge follows slower
-        let trail_t = bezier(clamp01((t - 0.3) * 1.5));
+    // Keyframe 0.0: Start position and size
+    offset_animation.InsertKeyFrameWithEasingFunction(
+        0.0,
+        Vector2::new(start_cx, start_cy),
+        &easing,
+    )?;
+    size_animation.InsertKeyFrameWithEasingFunction(
+        0.0,
+        Vector2::new(previous_cursor.size.width, start_thickness),
+        &easing,
+    )?;
+    geo_offset_animation.InsertKeyFrameWithEasingFunction(
+        0.0,
+        Vector2::new(0.0, -start_thickness / 2.0),
+        &easing,
+    )?;
 
-        // Calculate positions of leading and trailing edges along the line
-        let lead_cx = lerp(start_cx, end_cx, lead_t);
-        let lead_cy = lerp(start_cy, end_cy, lead_t);
-        let trail_cx = lerp(start_cx, end_cx, trail_t);
-        let trail_cy = lerp(start_cy, end_cy, trail_t);
+    // Keyframe 0.5: Maximum stretch (leading edge at target, trailing at start)
+    offset_animation.InsertKeyFrameWithEasingFunction(
+        0.5,
+        Vector2::new(start_cx, start_cy),
+        &easing,
+    )?;
+    size_animation.InsertKeyFrameWithEasingFunction(
+        0.5,
+        Vector2::new(max_length, thickness),
+        &easing,
+    )?;
+    geo_offset_animation.InsertKeyFrameWithEasingFunction(
+        0.5,
+        Vector2::new(0.0, -thickness / 2.0),
+        &easing,
+    )?;
 
-        // The line goes from trail position to lead position
-        let line_dx = lead_cx - trail_cx;
-        let line_dy = lead_cy - trail_cy;
-        let line_length = line_dx.hypot(line_dy).max(1.0);
-        let line_angle = line_dy.atan2(line_dx);
-
-        // Interpolate thickness
-        let current_thickness = lerp(previous_cursor.size.height, thickness, lead_t);
-
-        // Shape offset is at the trailing edge (start of the line)
-        offset_animation.InsertKeyFrame(t, Vector2::new(trail_cx, trail_cy))?;
-        rotation_animation.InsertKeyFrame(t, line_angle)?;
-
-        // Geometry size: length x thickness
-        size_animation.InsertKeyFrame(t, Vector2::new(line_length, current_thickness))?;
-        geo_offset_animation.InsertKeyFrame(t, Vector2::new(0.0, -current_thickness / 2.0))?;
-    }
+    // Keyframe 1.0: End position (trailing edge catches up)
+    offset_animation.InsertKeyFrameWithEasingFunction(
+        1.0,
+        Vector2::new(end_cx, end_cy),
+        &easing,
+    )?;
+    size_animation.InsertKeyFrameWithEasingFunction(
+        1.0,
+        Vector2::new(current_cursor.size.width, thickness),
+        &easing,
+    )?;
+    geo_offset_animation.InsertKeyFrameWithEasingFunction(
+        1.0,
+        Vector2::new(0.0, -thickness / 2.0),
+        &easing,
+    )?;
 
     // Create a scoped batch to track animation completion
     let batch = compositor.CreateScopedBatch(CompositionBatchTypes::Animation)?;
 
     // Start the animations
     shape.StartAnimation(windows::core::h!("Offset"), &offset_animation)?;
-    shape.StartAnimation(windows::core::h!("RotationAngle"), &rotation_animation)?;
     geometry.StartAnimation(windows::core::h!("Size"), &size_animation)?;
     geometry.StartAnimation(windows::core::h!("Offset"), &geo_offset_animation)?;
 
